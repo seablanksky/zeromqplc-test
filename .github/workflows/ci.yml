@@ -1,0 +1,112 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Ubuntu: native ipc:// is available, libzmq comes from apt.
+        # Windows: builds against MSVC + libzmq built from source, matching the
+        # third_party/libzmq layout the .pri expects by default.
+        os: [ubuntu-latest, windows-2019]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---------------- Linux dependencies ----------------
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qtbase5-dev libzmq3-dev
+
+      # ---------------- Windows toolchain ----------------
+      # Activate the MSVC (x64) build environment for cl/nmake/link.
+      - name: Set up MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # Qt 5.12.12 with the MSVC 2017 64-bit kit (matches the README setup).
+      - name: Install Qt (Windows)
+        if: runner.os == 'Windows'
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '5.12.12'
+          host: 'windows'
+          target: 'desktop'
+          arch: 'win64_msvc2017_64'
+
+      # Build libzmq and install it into third_party/libzmq so the default
+      # ZMQ_ROOT path in common/zeromq_common.pri resolves out of the box
+      # (include/zmq.h + lib/libzmq.lib).
+      - name: Build libzmq (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -e
+          git clone --depth 1 --branch v4.3.5 https://github.com/zeromq/libzmq.git libzmq-src
+          cmake -S libzmq-src -B libzmq-build -G "NMake Makefiles" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/third_party/libzmq" \
+            -DBUILD_SHARED=ON \
+            -DBUILD_STATIC=OFF \
+            -DBUILD_TESTS=OFF \
+            -DENABLE_CURVE=OFF \
+            -DZMQ_BUILD_DRAFTS=OFF \
+            -DWITH_DOCS=OFF
+          cmake --build libzmq-build
+          cmake --install libzmq-build
+          echo "::group::Installed libzmq layout"
+          ls -R "$GITHUB_WORKSPACE/third_party/libzmq"
+          echo "::endgroup::"
+
+      # ---------------- Build ----------------
+      - name: Build project (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          qmake zeromq_ipc_demo.pro
+          make -j"$(nproc)"
+
+      - name: Build project (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          qmake zeromq_ipc_demo.pro
+          nmake
+
+      # ---------------- Integration smoke test (Linux) ----------------
+      # Boots the REP server, runs the REQ client against it over loopback TCP,
+      # and asserts a real request/reply round-trip happened.
+      - name: Smoke test (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -e
+          EP="tcp://127.0.0.1:5560"
+          ./ipc_server/ipc_server "$EP" > server.log 2>&1 &
+          SERVER_PID=$!
+          # Wait until the server reports it is bound.
+          for _ in $(seq 1 30); do
+            if grep -q "REP server started" server.log; then break; fi
+            sleep 0.2
+          done
+          ./ipc_client/ipc_client "$EP" 3 > client.log 2>&1 || CLIENT_RC=$?
+          kill "$SERVER_PID" 2>/dev/null || true
+          wait "$SERVER_PID" 2>/dev/null || true
+
+          echo "===== server.log ====="; cat server.log
+          echo "===== client.log ====="; cat client.log
+
+          grep -q "REP server started" server.log
+          grep -q "recv:" client.log
+          test "${CLIENT_RC:-0}" -eq 0
